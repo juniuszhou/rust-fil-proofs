@@ -1,4 +1,4 @@
-use std::cmp;
+use std::cmp::{max, min};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
@@ -176,35 +176,44 @@ impl<H: Hasher> Graph<H> for BucketGraph<H> {
                 Ok(())
             }
             _ => {
-                // The degree `m` minus 1; the degree without the immediate predecessor node.
+                // `m_prime` is the indegree of the metagraph. If `m` is the degree of the DRG (the
+                // non-meta graph) and the DRG always sets one of `node`'s parents to be its
+                // immediate predecessor, then we only query `m - 1` parents from the metagraph to
+                // produce of DRG of indegree `m`.
                 let m_prime = m - 1;
 
-                // seed = self.seed | node
+                // Create a unique RNG for this (graph, child node) pair so that parent generation
+                // is deterministic across. Note that `node` is guaranteed to fit within a `u32`.
                 let mut seed = [0u8; 32];
                 seed[..28].copy_from_slice(&self.seed);
                 seed[28..].copy_from_slice(&(node as u32).to_le_bytes());
                 let mut rng = ChaChaRng::from_seed(seed);
 
+                // Create a metagraph from which we will sample `m_prime` number of parents for
+                // `node`. The metagraph is constructed by expanding the DRG of `self.nodes` number
+                // of nodes `m_prime` number of times. Group the nodes in the metagraph into
+                // buckets. For each parent that is generated using the metagraph (all parents
+                // except for `node`'s immediate predecessor), randomly choose a bucket then
+                // randomly choose a parent from that bucket. Map each parent in the metagraph to
+                // its corresponding node in the DRG (the non-meta graph).
                 for (k, parent) in parents.iter_mut().take(m_prime).enumerate() {
-                    // Iterate over `m_prime` number of meta nodes for the i-th real node. Simulate
-                    // the edges that we would add from previous graph nodes. If any edge is added
-                    // from a meta node of j-th real node then add edge (j,i).
-                    let logi = ((node * m_prime) as f32).log2().floor() as usize;
-                    let j = rng.gen::<usize>() % logi;
-                    let jj = cmp::min(node * m_prime + k, 1 << (j + 1));
-                    let back_dist = rng.gen_range(cmp::max(jj >> 1, 2), jj + 1);
-                    let out = (node * m_prime + k - back_dist) / m_prime;
+                    let n_buckets = ((node * m_prime) as f32).log2().ceil() as usize;
+                    let bucket_index = (rng.gen::<usize>() % n_buckets) + 1;
+                    let max_distance_in_bucket = min(node * m_prime + k, 1 << bucket_index);
+                    let min_distance_in_bucket = max(2, max_distance_in_bucket >> 1);
+                    let n_distances_in_bucket = max_distance_in_bucket - min_distance_in_bucket + 1;
+                    let distance =
+                        min_distance_in_bucket + (rng.gen::<usize>() % n_distances_in_bucket);
+                    let mapped_parent = (node * m_prime + k - distance) / m_prime;
 
-                    // remove self references and replace with reference to previous node
-                    if out == node {
-                        *parent = (node - 1) as u32;
+                    // If the parent in the metagraph gets mapped to `node` in the DRG, set the
+                    // parent in the DRG to `node`'s immediate predecessor (despite the DRG already
+                    // containing that edge).
+                    *parent = if mapped_parent == node {
+                        node as u32 - 1
                     } else {
-                        ensure!(
-                            out <= node,
-                            "Parent node must be smaller than current node."
-                        );
-                        *parent = out as u32;
-                    }
+                        mapped_parent as u32
+                    };
                 }
 
                 // Add the immediate predecessor as a parent to ensure unique topological ordering.
